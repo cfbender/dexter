@@ -80,6 +80,11 @@ type Server struct {
 	notifiedOTPMismatch sync.Once  // prevents repeated OTP mismatch warnings
 
 	backgroundWork sync.WaitGroup // tracks background reindex goroutines so the store isn't closed while they're running
+
+	diagMu      sync.Mutex
+	diagTimers  map[protocol.DocumentURI]*time.Timer
+	diagPending map[protocol.DocumentURI]string
+	diagDelay   time.Duration
 }
 
 func (s *Server) debugf(format string, args ...interface{}) {
@@ -104,6 +109,9 @@ func NewServer(s *store.Store, projectRoot string) *Server {
 		followDelegates: true,
 		usingCache:      make(map[string]*usingCacheEntry),
 		depsCache:       make(map[string]bool),
+		diagTimers:      make(map[protocol.DocumentURI]*time.Timer),
+		diagPending:     make(map[protocol.DocumentURI]string),
+		diagDelay:       defaultDiagnosticsDebounceDelay,
 	}
 }
 
@@ -292,6 +300,9 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		if v, ok := opts["followDelegates"].(bool); ok {
 			s.followDelegates = v
 		}
+		if v, ok := parseDiagnosticsDebounceMS(opts["diagnosticsDebounceMs"]); ok {
+			s.setDiagnosticsDebounceDelay(v)
+		}
 		if v, ok := opts["stdlibPath"].(string); ok {
 			explicitStdlibPath = v
 		}
@@ -420,6 +431,7 @@ func (s *Server) Initialized(ctx context.Context, params *protocol.InitializedPa
 
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.closeFormatters()
+	s.stopAllDiagnosticsTimers()
 	return nil
 }
 
@@ -2020,6 +2032,25 @@ func (s *Server) collectCallbacksInChain(moduleName, functionName string, arity 
 }
 
 func (s *Server) DidChangeConfiguration(ctx context.Context, params *protocol.DidChangeConfigurationParams) error {
+	settings, ok := params.Settings.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	if dexter, ok := settings["dexter"].(map[string]interface{}); ok {
+		settings = dexter
+	}
+
+	if v, ok := settings["followDelegates"].(bool); ok {
+		s.followDelegates = v
+	}
+	if v, ok := settings["debug"].(bool); ok {
+		s.debug = v
+	}
+	if v, ok := parseDiagnosticsDebounceMS(settings["diagnosticsDebounceMs"]); ok {
+		s.setDiagnosticsDebounceDelay(v)
+	}
+
 	return nil
 }
 func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.DidChangeWatchedFilesParams) error {

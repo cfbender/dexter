@@ -439,6 +439,7 @@ Dexter reads `initializationOptions` from your editor configuration:
 - **`followDelegates`** (boolean, default: `true`): follow `defdelegate` targets on lookup.
 - **`stdlibPath`** (string): override the Elixir stdlib directory to index. Defaults to auto-detection; use this if your install is non-standard.
 - **`debug`** (boolean, default: `false`): enable verbose logging to stderr. Logs timing and resolution details for every definition, hover, references, and rename request. Can also be enabled via the `DEXTER_DEBUG=true` environment variable.
+- **`diagnosticsDebounceMs`** (number, default: `150`): debounce delay in milliseconds for background diagnostics publishing while typing. Clamped to `25..2000`.
 
 ## Index database location (.dexter.db)
 
