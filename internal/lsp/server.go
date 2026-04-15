@@ -432,6 +432,7 @@ func (s *Server) Exit(ctx context.Context) error {
 
 func (s *Server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocumentParams) error {
 	s.docs.Set(string(params.TextDocument.URI), params.TextDocument.Text)
+	s.scheduleDiagnostics(params.TextDocument.URI)
 
 	// Eagerly start the persistent formatter so the first format is instant.
 	// Skip deps and stdlib files — we don't format those.
@@ -452,12 +453,14 @@ func (s *Server) DidChange(ctx context.Context, params *protocol.DidChangeTextDo
 	if len(params.ContentChanges) > 0 {
 		// Full sync mode — last change contains the full text
 		s.docs.Set(string(params.TextDocument.URI), params.ContentChanges[len(params.ContentChanges)-1].Text)
+		s.scheduleDiagnostics(params.TextDocument.URI)
 	}
 	return nil
 }
 
 func (s *Server) DidClose(ctx context.Context, params *protocol.DidCloseTextDocumentParams) error {
 	s.docs.Close(string(params.TextDocument.URI))
+	s.clearDiagnostics(params.TextDocument.URI)
 	return nil
 }
 
