@@ -1,10 +1,6 @@
 package treesitter
 
-import (
-	"slices"
-
-	tree_sitter "github.com/tree-sitter/go-tree-sitter"
-)
+import tree_sitter "github.com/tree-sitter/go-tree-sitter"
 
 // UndefinedVariable is one unresolved variable usage in source.
 type UndefinedVariable struct {
@@ -42,8 +38,8 @@ func collectUndefinedVariables(root, node *tree_sitter.Node, src []byte, out *[]
 		if shouldCheckIdentifierForUndefined(node, src, name) {
 			line := uint(node.StartPosition().Row)
 			col := uint(node.StartPosition().Column)
-			visible := FindVariablesInScopeWithTree(root, src, line, col)
-			if len(visible) > 0 && !containsString(visible, name) {
+			inScope := FindVariablesInScopeWithTree(root, src, line, col) != nil
+			if inScope && len(FindVariableOccurrencesWithTree(root, src, line, col)) == 0 {
 				*out = append(*out, UndefinedVariable{
 					Name:     name,
 					Line:     line,
@@ -76,6 +72,9 @@ func shouldCheckIdentifierForUndefined(node *tree_sitter.Node, src []byte, name 
 		return false
 	}
 	if isKeywordKeyIdentifier(node, src) {
+		return false
+	}
+	if isFunctionCaptureIdentifier(node, src) {
 		return false
 	}
 	return true
@@ -116,6 +115,28 @@ func isBindingIdentifier(node *tree_sitter.Node, src []byte) bool {
 	}
 	if isInArrowLeftPatternUnpinned(node, src) {
 		return true
+	}
+	if isInCaseClausePatternUnpinned(node, src) {
+		return true
+	}
+	return false
+}
+
+func isInCaseClausePatternUnpinned(node *tree_sitter.Node, src []byte) bool {
+	current := node.Parent()
+	for current != nil {
+		if current.Kind() == "stab_clause" {
+			for i := uint(0); i < uint(current.ChildCount()); i++ {
+				child := current.Child(i)
+				if child.Kind() == "binary_operator" && child.ChildCount() >= 3 && child.Child(1).Utf8Text(src) == "->" {
+					lhs := child.Child(0)
+					if node.StartByte() >= lhs.StartByte() && node.EndByte() <= lhs.EndByte() {
+						return !isPinnedIdentifier(node, src, lhs)
+					}
+				}
+			}
+		}
+		current = current.Parent()
 	}
 	return false
 }
@@ -196,6 +217,35 @@ func isKeywordKeyIdentifier(node *tree_sitter.Node, src []byte) bool {
 	return true
 }
 
-func containsString(items []string, target string) bool {
-	return slices.Contains(items, target)
+func isFunctionCaptureIdentifier(node *tree_sitter.Node, src []byte) bool {
+	if node == nil {
+		return false
+	}
+
+	start := int(node.StartByte())
+	end := int(node.EndByte())
+	if start <= 0 || end >= len(src) {
+		return false
+	}
+
+	prev := start - 1
+	for prev >= 0 && (src[prev] == ' ' || src[prev] == '\t') {
+		prev--
+	}
+	if prev < 0 || src[prev] != '&' {
+		return false
+	}
+
+	next := end
+	for next < len(src) && (src[next] == ' ' || src[next] == '\t') {
+		next++
+	}
+	if next >= len(src) || src[next] != '/' {
+		return false
+	}
+	next++
+	if next >= len(src) || src[next] < '0' || src[next] > '9' {
+		return false
+	}
+	return true
 }

@@ -3089,6 +3089,33 @@ func TestFormatter_DidOpen_SkipsDepsFiles(t *testing.T) {
 	}
 }
 
+func TestAncestorDepsRoots_UmbrellaSubAppIncludesParentDeps(t *testing.T) {
+	tmp := t.TempDir()
+	umbrellaRoot := filepath.Join(tmp, "umbrella")
+	appRoot := filepath.Join(umbrellaRoot, "apps", "my_app")
+
+	if err := os.MkdirAll(appRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(umbrellaRoot, "mix.exs"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appRoot, "mix.exs"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(umbrellaRoot, "deps", "ecto"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	server := NewServer(nil, appRoot)
+	roots := server.ancestorDepsRoots()
+
+	want := filepath.Join(umbrellaRoot, "deps")
+	if len(roots) != 1 || roots[0] != want {
+		t.Fatalf("expected [%q], got %v", want, roots)
+	}
+}
+
 func TestMixCommand_SetsDir(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()

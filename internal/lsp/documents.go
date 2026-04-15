@@ -78,6 +78,20 @@ func (ds *DocumentStore) Get(uri string) (string, bool) {
 	return doc.text, true
 }
 
+// URIs returns a snapshot of currently open document URIs.
+func (ds *DocumentStore) URIs() []string {
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
+	if len(ds.docs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ds.docs))
+	for uri := range ds.docs {
+		out = append(out, uri)
+	}
+	return out
+}
+
 // GetTree returns a cached tree-sitter parse tree and its source bytes for
 // the given URI. Parses on first access and caches the result. The tree is
 // invalidated on the next Set() call. Callers must not close the returned tree.

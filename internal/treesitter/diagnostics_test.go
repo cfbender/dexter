@@ -67,3 +67,34 @@ end`)
 		t.Fatalf("expected undefined variable 'missing', got %q", vars[0].Name)
 	}
 }
+
+func TestFindUndefinedVariables_FunctionCaptureNotVariable(t *testing.T) {
+	src := []byte(`defmodule MyApp.Accounts do
+  def my_function(test) do
+    Enum.map(test, &is_test?/1)
+  end
+
+  defp is_test?(test), do: true
+end`)
+
+	vars := FindUndefinedVariables(src)
+	if len(vars) != 0 {
+		t.Fatalf("expected no undefined variables, got %d", len(vars))
+	}
+}
+
+func TestFindUndefinedVariables_CaseGuardPatternBindingVisible(t *testing.T) {
+	src := []byte(`defmodule SharedLib.Worker do
+  def run(value) do
+    case value do
+      item when is_binary(item) and item != "" -> item
+      _ -> value
+    end
+  end
+end`)
+
+	vars := FindUndefinedVariables(src)
+	if len(vars) != 0 {
+		t.Fatalf("expected no undefined variables, got %d", len(vars))
+	}
+}

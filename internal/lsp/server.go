@@ -206,6 +206,13 @@ func (s *Server) backgroundReindex() {
 
 		walkAndIndex(s.projectRoot, true)
 
+		// In umbrella/sub-app setups, deps may live in an ancestor Mix root's
+		// deps/ directory (outside current projectRoot). Index those too so
+		// cross-file resolution/diagnostics can see external library symbols.
+		for _, depsRoot := range s.ancestorDepsRoots() {
+			walkAndIndex(depsRoot, false)
+		}
+
 		// Prune store entries for files no longer on disk
 		if storedPaths, err := s.store.ListFilePaths(); err == nil {
 			var toRemove []string
@@ -218,6 +225,10 @@ func (s *Server) backgroundReindex() {
 				_ = s.store.RemoveFiles(toRemove)
 			}
 		}
+
+		// New index data (including deps) may change diagnostics for open files.
+		// Re-run diagnostics so stale false positives clear without requiring edits.
+		s.scheduleDiagnosticsForOpenDocs()
 
 		elapsed := time.Since(start).Round(time.Millisecond)
 		log.Printf("Background reindex: %d files updated (%s)", reindexed, elapsed)
@@ -1295,6 +1306,44 @@ func (s *Server) lookupThroughUseOf(fullModule, functionName string) []store.Loo
 	return s.lookupThroughUse(fileText, functionName, ExtractAliases(fileText))
 }
 
+// lookupThroughImportsOf looks up functionName through modules imported by
+// fullModule, recursively following import chains.
+func (s *Server) lookupThroughImportsOf(fullModule, functionName string, visited map[string]bool) []store.LookupResult {
+	if visited == nil {
+		visited = make(map[string]bool)
+	}
+	if visited[fullModule] {
+		return nil
+	}
+	visited[fullModule] = true
+
+	modResults, err := s.store.LookupModule(fullModule)
+	if err != nil || len(modResults) == 0 {
+		return nil
+	}
+	fileText, _, ok := s.readFileText(modResults[0].FilePath)
+	if !ok {
+		return nil
+	}
+
+	tf := NewTokenizedFile(fileText)
+	aliases := ExtractAliases(fileText)
+	for _, mod := range tf.ExtractImports() {
+		resolved := resolveModule(mod, aliases)
+		if results, err := s.store.LookupFunction(resolved, functionName); err == nil && len(results) > 0 {
+			return results
+		}
+		if results := s.lookupThroughUseOf(resolved, functionName); len(results) > 0 {
+			return results
+		}
+		if results := s.lookupThroughImportsOf(resolved, functionName, visited); len(results) > 0 {
+			return results
+		}
+	}
+
+	return nil
+}
+
 // lookupThroughUse searches for functionName in definitions injected by `use`
 // declarations. Inline defs (defined directly in the quote do block) take
 // priority over imported ones. Later `use` declarations shadow earlier ones.
@@ -1604,8 +1653,12 @@ func (s *Server) resolveBareFunctionModule(filePath, text string, lines []string
 	// Explicit imports (direct definitions only — fast store lookup)
 	imports := ExtractImports(text)
 	for _, mod := range imports {
-		if results, err := s.store.LookupFunction(mod, functionName); err == nil && len(results) > 0 {
-			return mod
+		resolved := resolveModule(mod, aliases)
+		if results, err := s.store.LookupFunction(resolved, functionName); err == nil && len(results) > 0 {
+			return resolved
+		}
+		if apiMod := s.resolveQueryAPIProviderModule(resolved, functionName); apiMod != "" {
+			return apiMod
 		}
 	}
 
@@ -1625,11 +1678,52 @@ func (s *Server) resolveBareFunctionModule(filePath, text string, lines []string
 	// Slow fallback: function may be injected into an imported module via its
 	// own use chain (e.g. MyApp.Factory uses ExMachina, which injects `insert`).
 	for _, mod := range imports {
-		if results := s.lookupThroughUseOf(mod, functionName); len(results) > 0 {
-			return mod
+		resolved := resolveModule(mod, aliases)
+		if results := s.lookupThroughUseOf(resolved, functionName); len(results) > 0 {
+			return resolved
+		}
+		if results := s.lookupThroughImportsOf(resolved, functionName, map[string]bool{}); len(results) > 0 {
+			return resolved
+		}
+		if apiMod := s.resolveQueryAPIProviderModule(resolved, functionName); apiMod != "" {
+			return apiMod
 		}
 	}
 
+	return ""
+}
+
+// resolveQueryAPIProviderModule resolves query DSL helper functions that are
+// commonly documented in <Provider>.API (for example Ecto.Query.API), even
+// when the imported provider module itself does not directly import that API.
+func (s *Server) resolveQueryAPIProviderModule(providerModule, functionName string) string {
+	if !strings.HasSuffix(providerModule, ".Query") {
+		return ""
+	}
+	apiModule := providerModule + ".API"
+	if results, err := s.store.LookupFunction(apiModule, functionName); err == nil && len(results) > 0 {
+		return apiModule
+	}
+	if results := s.lookupThroughUseOf(apiModule, functionName); len(results) > 0 {
+		return apiModule
+	}
+	if results := s.lookupThroughImportsOf(apiModule, functionName, map[string]bool{}); len(results) > 0 {
+		return apiModule
+	}
+
+	// Some query DSL helpers may be implemented on the provider root module
+	// (for example External.assoc/2) while query composition macros live under
+	// External.Query. Fall back to root module to keep diagnostics/navigation.
+	rootModule := strings.TrimSuffix(providerModule, ".Query")
+	if results, err := s.store.LookupFunction(rootModule, functionName); err == nil && len(results) > 0 {
+		return rootModule
+	}
+	if results := s.lookupThroughUseOf(rootModule, functionName); len(results) > 0 {
+		return rootModule
+	}
+	if results := s.lookupThroughImportsOf(rootModule, functionName, map[string]bool{}); len(results) > 0 {
+		return rootModule
+	}
 	return ""
 }
 
@@ -4344,6 +4438,42 @@ func isDepsFileUncached(filePath string) bool {
 		}
 		current = parent
 	}
+}
+
+// ancestorDepsRoots returns deps/ directories that belong to ancestor Mix
+// project roots of s.projectRoot (excluding s.projectRoot itself).
+// This covers umbrella sub-app roots where dependencies are stored at the
+// umbrella root (../deps) rather than inside the sub-app.
+func (s *Server) ancestorDepsRoots() []string {
+	if s.projectRoot == "" {
+		return nil
+	}
+
+	projectRoot := filepath.Clean(s.projectRoot)
+	current := filepath.Dir(projectRoot)
+	seen := make(map[string]bool)
+	var out []string
+
+	for {
+		if _, err := os.Stat(filepath.Join(current, "mix.exs")); err == nil {
+			depsDir := filepath.Join(current, "deps")
+			if info, err := os.Stat(depsDir); err == nil && info.IsDir() {
+				cleanDeps := filepath.Clean(depsDir)
+				if !seen[cleanDeps] {
+					seen[cleanDeps] = true
+					out = append(out, cleanDeps)
+				}
+			}
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		current = parent
+	}
+
+	return out
 }
 
 // readFileText returns the contents of filePath, preferring the in-memory
